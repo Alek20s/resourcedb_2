@@ -1,4 +1,5 @@
 from django.contrib.auth.decorators import login_required
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramStrictWordSimilarity
 from django.core.paginator import Paginator
 from django.db.models import Q
 from django.shortcuts import get_object_or_404, get_list_or_404, render, redirect
@@ -12,24 +13,32 @@ from . import forms
 
 class IndexView(TemplateView):
     form_class = forms.EventForm
-    template_name = "info/dashboard_event.html"
+    template_name = "info/index.html"
 
     def get(self, request):
-        return render(request, "info/index.html", {})
+        return self.render_to_response({})
 
     def post(self, request):
-        query = request.POST['search']
-        orgs = models.Organisation.objects.filter(Q(name__icontains=query) | Q(description__icontains=query))
-        events = models.Event.objects.filter(Q(name__icontains=query) | Q(description__icontains=query))
-        resources = models.Resource.objects.filter(Q(name__icontains=query) | Q(description__icontains=query))
+        search_vector = SearchVector("name", weight="A") + SearchVector("description", weight="A")
+        query = request.POST["search"]
 
-        return render(
-            request,
-            "info/index.html",
-            {
-                "results": [*orgs, *events, *resources],
-            }
+        events = models.Event.objects.annotate(
+            similarity=TrigramStrictWordSimilarity(query, "name") + TrigramStrictWordSimilarity(query, "description"),
+        ).filter(
+            similarity__gte=0.2
+        ).order_by(
+            '-similarity'
         )
+
+        resources = models.Resource.objects.annotate(
+            similarity=TrigramStrictWordSimilarity(query, "name") + TrigramStrictWordSimilarity(query, "description"),
+        ).filter(
+            similarity__gte=0.2
+        ).order_by(
+            "-similarity"
+        )
+
+        return self.render_to_response({"results": [*events, *resources]})
 
 def organisations(request):
     return render(request, "info/organisations.html", {"orgs": models.Organisation.objects.all().order_by("name")})
@@ -104,6 +113,7 @@ def dashboard_org(request, org):
             "form": forms.OrgForm(instance=org),
             "resources": models.Resource.objects.filter(organisation=org),
             "events": models.Event.objects.filter(organisation=org),
+            "contacts": models.Contact.objects.filter(organisation=org),
         },
     )
 
@@ -306,7 +316,7 @@ class DashboardContactsView(ListView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context["org"] = get_object_or_404(models.Organisation, slug=kwargs["org"])
-        context["contacts"] = models.Contact.objects.filter(event__organisation=context["org"])
+        context["contacts"] = models.Contact.objects.filter(organisation=context["org"])
 
         return context
 
@@ -323,18 +333,21 @@ class DashboardNewContactView(TemplateView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context["org"] = get_object_or_404(models.Organisation, slug=kwargs["org"])
+
+        context["organisation"] = get_object_or_404(models.Organisation, slug=kwargs["organisation"])
         context["form"] = self.form_class()
 
         return context
 
     def get(self, request, org):
-        return self.render_to_response(self.get_context_data(org=org))
+        return self.render_to_response(self.get_context_data(organisation=org))
 
     def post(self, request, org):
         form = self.form_class(request.POST)
+
         if form.is_valid():
             obj = models.Contact.objects.create(
+                organisation=models.Organisation.objects.get(slug=org),
                 name=form.cleaned_data["name"],
                 email=form.cleaned_data["email"],
                 phone_number=form.cleaned_data["phone_number"],
